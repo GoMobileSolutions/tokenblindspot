@@ -1,0 +1,209 @@
+{
+  "name": "Anthropic Daily Usage Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "id": "9ecd0b6a-51be-4f7c-b81c-f3824526656b",
+      "name": "Daily 8am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/organizations/usage_report/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "starting_at",
+              "value": "2024-01-01T00:00:00Z"
+            },
+            {
+              "name": "ending_at",
+              "value": "={{ $now.setZone(\"UTC\").startOf(\"day\").toISO() }}"
+            },
+            {
+              "name": "bucket_width",
+              "value": "1d"
+            },
+            {
+              "name": "limit",
+              "value": "31"
+            },
+            {
+              "name": "group_by[]",
+              "value": "model"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {}
+          },
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "name": "page",
+                    "value": "={{ $response.body.next_page }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ $response.body.has_more === false }}",
+              "limitPagesFetched": true,
+              "maxRequests": 40
+            }
+          }
+        }
+      },
+      "id": "771518e7-bfa6-41ba-81a6-99cef3e80983",
+      "name": "Fetch Anthropic Usage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        0
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "qUsWhzrnbrsYqlEY",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Approximate USD price per 1M tokens by model family.\n// Anthropic's messages usage report returns TOKEN counts, not cost, so we\n// estimate cost from published list prices. Adjust these if your rates differ.\nconst PRICES = [\n  { match: 'opus',   inPer1M: 15.00, outPer1M: 75.00 },\n  { match: 'sonnet', inPer1M: 3.00,  outPer1M: 15.00 },\n  { match: 'haiku',  inPer1M: 0.80,  outPer1M: 4.00 },\n];\nconst DEFAULT_PRICE = { inPer1M: 3.00, outPer1M: 15.00 };\nfunction priceFor(model) {\n  const m = (model || '').toLowerCase();\n  return PRICES.find((p) => m.includes(p.match)) || DEFAULT_PRICE;\n}\n\n// Lifetime is bounded by the fetch start date in the HTTP node.\nconst LIFETIME_SINCE = '2024-01-01';\n\nconst NL = String.fromCharCode(10);\nconst fmt = (n) => Number(n).toLocaleString('en-US');\n\n// Cutoffs based on COMPLETE days in UTC (today is excluded by ending_at).\nconst now = new Date();\nconst startOfTodayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());\nconst DAY = 86400000;\nconst dailyStart = startOfTodayUTC - DAY;        // yesterday 00:00 UTC\nconst weeklyStart = startOfTodayUTC - 7 * DAY;   // last 7 complete days\nconst monthlyStart = startOfTodayUTC - 30 * DAY; // last 30 complete days\n\nfunction addTo(agg, model, inTok, outTok) {\n  if (!agg[model]) agg[model] = { model, inputTokens: 0, outputTokens: 0 };\n  agg[model].inputTokens += inTok;\n  agg[model].outputTokens += outTok;\n}\n\nconst daily = {};\nconst weekly = {};\nconst monthly = {};\nconst lifetime = {};\n\n// Each input item is one HTTP page: { data: [ { starting_at, ending_at, results: [...] } ] }\nfor (const item of $input.all()) {\n  const buckets = (item.json && item.json.data) || [];\n  for (const bucket of buckets) {\n    const startMs = Date.parse(bucket.starting_at);\n    for (const r of bucket.results || []) {\n      const model = r.model || 'unknown';\n      const inTok =\n        (r.uncached_input_tokens || 0) +\n        (r.cache_creation_input_tokens || 0) +\n        (r.cache_read_input_tokens || 0) +\n        (r.input_tokens || 0);\n      const outTok = r.output_tokens || 0;\n      addTo(lifetime, model, inTok, outTok);\n      if (startMs >= monthlyStart) addTo(monthly, model, inTok, outTok);\n      if (startMs >= weeklyStart) addTo(weekly, model, inTok, outTok);\n      if (startMs >= dailyStart && startMs < startOfTodayUTC) addTo(daily, model, inTok, outTok);\n    }\n  }\n}\n\nfunction summarize(agg) {\n  const rows = Object.values(agg).map((row) => {\n    const p = priceFor(row.model);\n    const estCost = (row.inputTokens / 1e6) * p.inPer1M + (row.outputTokens / 1e6) * p.outPer1M;\n    return {\n      ...row,\n      totalTokens: row.inputTokens + row.outputTokens,\n      estCostUsd: Math.round(estCost * 100) / 100,\n    };\n  });\n  rows.sort((a, b) => b.estCostUsd - a.estCostUsd);\n  const totals = rows.reduce(\n    (a, r) => {\n      a.inputTokens += r.inputTokens;\n      a.outputTokens += r.outputTokens;\n      a.totalTokens += r.totalTokens;\n      a.estCostUsd += r.estCostUsd;\n      return a;\n    },\n    { inputTokens: 0, outputTokens: 0, totalTokens: 0, estCostUsd: 0 },\n  );\n  totals.estCostUsd = Math.round(totals.estCostUsd * 100) / 100;\n  return { rows, totals };\n}\n\nconst D = summarize(daily);\nconst W = summarize(weekly);\nconst M = summarize(monthly);\nconst L = summarize(lifetime);\n\nconst dailyLabel = new Date(dailyStart).toISOString().slice(0, 10);\n\nfunction totalsLine(s) {\n  return '*' + fmt(s.totals.totalTokens) + '* tokens \\u00b7 *$' + s.totals.estCostUsd.toFixed(2) +\n    '*  _(' + fmt(s.totals.inputTokens) + ' in / ' + fmt(s.totals.outputTokens) + ' out)_';\n}\n\nconst blocks = [];\nblocks.push({ type: 'header', text: { type: 'plain_text', text: 'Anthropic API usage — ' + dailyLabel } });\n\n// Daily section with per-model breakdown\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:calendar: Daily (' + dailyLabel + ')*' + NL + totalsLine(D) } });\nif (D.rows.length) {\n  let detail = '';\n  for (const r of D.rows) {\n    detail += '\\u2022 *' + r.model + '* — ' + fmt(r.totalTokens) + ' tok \\u00b7 $' + r.estCostUsd.toFixed(2) + NL;\n  }\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: detail.trim() } });\n} else {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_No usage recorded for this day._' } });\n}\n\nblocks.push({ type: 'divider' });\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:date: Last 7 days*' + NL + totalsLine(W) } });\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:spiral_calendar_pad: Last 30 days*' + NL + totalsLine(M) } });\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:infinity: Lifetime (since ' + LIFETIME_SINCE + ')*' + NL + totalsLine(L) } });\nblocks.push({\n  type: 'context',\n  elements: [\n    {\n      type: 'mrkdwn',\n      text: 'Cost is estimated from list prices in the Code node. Lifetime is bounded by the fetch start date (' + LIFETIME_SINCE + ') — change it in the Code node and HTTP node to go further back.',\n    },\n  ],\n});\n\nreturn [\n  {\n    json: {\n      dailyLabel,\n      daily: D,\n      weekly: W,\n      monthly: M,\n      lifetime: L,\n      blocksUi: { blocks },\n    },\n  },\n];"
+      },
+      "id": "3b2d602d-a3de-4361-92b4-86bfafca8623",
+      "name": "Aggregate By Model",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0C4FFT63SQ",
+          "mode": "list",
+          "cachedResultName": "ai_tokens_usage"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json.blocksUi) }}",
+        "otherOptions": {}
+      },
+      "id": "90253fa6-0f0e-45f2-b088-fba2f44298b6",
+      "name": "Post Digest To Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        672,
+        0
+      ],
+      "webhookId": "2c8e7e95-19a7-407d-9ce7-a484eb89227a",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "T00YNLKsdLUsNC7u",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Daily 8am": {
+      "main": [
+        [
+          {
+            "node": "Fetch Anthropic Usage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Anthropic Usage": {
+      "main": [
+        [
+          {
+            "node": "Aggregate By Model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate By Model": {
+      "main": [
+        [
+          {
+            "node": "Post Digest To Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "36dbe61c-d5ea-40a9-a9f0-fcb6b20cff19",
+  "meta": {
+    "instanceId": "bb223473a17dda71a803fc4189704ee371f41545ce83c99a1029813266927d00"
+  },
+  "nodeGroups": [
+    {
+      "id": "4728d72a-c0ed-4404-8277-271ebfe0008b",
+      "name": "Fetch",
+      "nodeIds": [
+        "771518e7-bfa6-41ba-81a6-99cef3e80983"
+      ],
+      "description": "Daily paginated pull of the full Anthropic org usage history (needs an admin API key)."
+    },
+    {
+      "id": "30a3a8e7-e9b3-43f4-a75b-4b013cbd285e",
+      "name": "Report",
+      "nodeIds": [
+        "3b2d602d-a3de-4361-92b4-86bfafca8623",
+        "90253fa6-0f0e-45f2-b088-fba2f44298b6"
+      ],
+      "description": "Roll up daily/weekly/monthly/lifetime tokens and estimated cost, then post a Block Kit digest to Slack."
+    }
+  ],
+  "id": "MC7zSNrijwhu8Ekp",
+  "tags": []
+}
